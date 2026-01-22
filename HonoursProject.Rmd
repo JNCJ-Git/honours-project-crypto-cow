@@ -1,0 +1,383 @@
+---
+title: "Honours project"
+author: "Jadon Ng Cheng Jie"
+date: "2025-10-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+The following code sets up the necessary libraries.
+
+```{r setup}
+# Full list of libraries to set up
+library(dplyr)
+library(DESeq2)
+library(ggplot2)
+library(GO.db)
+library(AnnotationDbi)
+library(topGO)
+library(org.Bt.eg.db)
+library(biomaRt)
+library(tidyverse)
+library(igraph) 
+library(ggraph)
+library(STRINGdb)
+library(pathview)
+library(KEGGREST)
+```
+
+## Filtering for immune GO terms
+
+This code will give a list of immune related GO terms.
+
+```{r}
+# Extract offspring terms for the immune system process (BP)
+offspring_list <- AnnotationDbi::as.list(GOBPOFFSPRING)
+
+immune_offspring <- offspring_list[["GO:0002376"]]
+
+# Check for NULL and fix
+if (is.null(immune_offspring)) {
+    stop("GO:0002376 has no offspring terms in your GO.db installation.")
+}
+
+# Convert safely to character vector
+immune_descendants <- unique(unlist(immune_offspring))
+```
+
+## Mapping GO terms onto full DESeq
+
+```{r}
+ensembl <- useMart("ensembl", dataset="btaurus_gene_ensembl")
+
+# Adjust file name here
+de <- read.csv("DifferentialExpression/DifferentialExpression/DE_significant_ICJ.csv")
+
+# Cleaning the file
+de$gene.ID <- trimws(de$gene.ID)
+
+# remove blank or NA gene IDs
+de <- de %>% filter(gene.ID != "" & !is.na(gene.ID))
+
+gene_list <- unique(de$gene.ID)
+go_map <- getBM(
+  attributes = c("external_gene_name", "go_id", "name_1006", "namespace_1003"),
+  filters = "external_gene_name",
+  values = gene_list,
+  mart = ensembl
+)
+```
+
+## Filtering mapped terms for immune terms
+
+```{r}
+# Filter GO annotations to keep only immune-related GO terms
+immune_annotations <- go_map %>%
+  filter(go_id %in% immune_descendants)
+
+# Extract unique gene symbols that are immune-related
+immune_genes <- unique(immune_annotations$external_gene_name)
+
+# Filter DE table to just the immune genes
+immune_de <- de %>%
+  filter(gene.ID %in% immune_genes)
+```
+
+##Over-representation test
+
+```{r}
+ORA_mapping <- AnnotationDbi::select(
+  org.Bt.eg.db,
+  keys = de$gene_id,
+  keytype = "ENSEMBL",
+  columns = c("ENTREZID")
+)
+ORA_mapping <- ORA_mapping[!is.na(ORA_mapping$ENTREZID), ]
+ORA_mapping <- ORA_mapping[!duplicated(ORA_mapping$ENSEMBL), ]
+
+de_copy <- de
+de_copy$ENTREZID <- ORA_mapping$ENTREZID[match(de_copy$gene_id, ORA_mapping$ENSEMBL)]
+immune_de_copy <- immune_de
+immune_de_copy$ENTREZID <- ORA_mapping$ENTREZID[match(immune_de_copy$gene_id, ORA_mapping$ENSEMBL)]
+
+all_genes <- de_copy$ENTREZID
+# Remove unmapped genes
+all_genes <- all_genes[!is.na(all_genes)]
+
+interesting <- immune_de_copy$ENTREZID
+interesting <- interesting[!is.na(interesting)]
+
+# Create named factor
+geneList <- factor(as.integer(all_genes %in% interesting))
+names(geneList) <- all_genes
+
+GOdata <- new("topGOdata",
+              ontology = "BP",
+              allGenes = geneList,
+              annot = annFUN.org,
+              mapping = "org.Bt.eg.db",
+              ID = "entrez")
+resultFisher <- runTest(GOdata, statistic = "fisher")
+ORA_Res <- GenTable(GOdata,
+                   classicFisher = resultFisher,
+                   orderBy = "classicFisher",
+                   topNodes = 50)
+
+```
+
+## KEGG pathway
+
+```{r}
+# Requires gene_id -> Entrez mapping
+data_vec <- de_copy$logFC
+names(data_vec) <- de_copy$ENTREZID
+data_vec <- data_vec[!is.na(names(data_vec))]
+
+KEGG_immune_paths <- c(
+  "04640", #Hematopoietic cell lineage [PATH:bta04640]
+  "04610", #Complement and coagulation cascades [PATH:bta04610]
+  "04611", #Platelet activation [PATH:bta04611]
+  "04613", #Neutrophil extracellular trap formation [PATH:bta04613]
+  "04620", #Toll-like receptor signaling pathway [PATH:bta04620]
+  "04621", #NOD-like receptor signaling pathway [PATH:bta04621]
+  "04622", #RIG-I-like receptor signaling pathway [PATH:bta04622]
+  "04623", #Cytosolic DNA-sensing pathway [PATH:bta04623]
+  "04625", #C-type lectin receptor signaling pathway [PATH:bta04625]
+  "04650", #Natural killer cell mediated cytotoxicity [PATH:bta04650]
+  "04612", #Antigen processing and presentation [PATH:bta04612]
+  "04660", #T cell receptor signaling pathway [PATH:bta04660]
+  "04658", #Th1 and Th2 cell differentiation [PATH:bta04658]
+  "04659", #Th17 cell differentiation [PATH:bta04659]
+  "04657", #IL-17 signaling pathway [PATH:bta04657]
+  "04662", #B cell receptor signaling pathway [PATH:bta04662]
+  "04664", #Fc epsilon RI signaling pathway [PATH:bta04664]
+  "04666", #Fc gamma R-mediated phagocytosis [PATH:bta04666]
+  "04670", #Leukocyte transendothelial migration [PATH:bta04670]
+  "04672", #Intestinal immune network for IgA production [PATH:bta04672]
+  "04062" #Chemokine signaling pathway [PATH:bta04062]
+)
+# This section is to output KEGG pathways as pngs. It is left commented to ensure code runs
+# smoother and to prevent overwriting files
+
+#for (pw in KEGG_immune_paths) {
+#  message("Processing pathway: ", pw)
+#  
+#  pathview(
+#    gene.data = data_vec,
+#    pathway.id = pw,
+#    species = "bta",
+#    out.suffix = "CryptoImmune",
+#    kegg.native = TRUE
+#  )
+#}
+
+```
+
+## KEGG Pathway activation strength
+
+```{r}
+calculate_pathway_activation <- function(de_table, pathways) {
+  
+  # Convert something like "04620" → "path:bta04620"
+  normalize_id <- function(id) {
+    id <- as.character(id)
+    if (grepl("^path:", id)) return(id)
+    if (grepl("^bta", id)) return(paste0("path:", id))
+    return(paste0("path:bta", id))
+  }
+  
+  # Compute activation for a single pathway
+  score_one <- function(pw_id) {
+    
+    full_id <- normalize_id(pw_id)
+    message("Querying KEGG:", full_id)
+    
+    # Query KEGG
+    pw <- keggGet(full_id)[[1]]
+    if (is.null(pw)) {
+      warning("KEGG returned NULL for ", full_id)
+      return(c(score = NA, n_genes = 0, name = NA))
+    }
+    
+    # Extract pathway name directly from keggGet
+    pw_name <- pw$NAME
+    if (length(pw_name) == 0) pw_name <- NA
+    
+    # Extract gene list
+    pw_genes <- pw$GENE
+    if (is.null(pw_genes))
+      return(c(score = NA, n_genes = 0, name = pw_name))
+    
+    # KEGG GENE section = ENTZID, SYMBOL, ENTZID, SYMBOL...
+    pw_entrez <- pw_genes[seq(1, length(pw_genes), 2)]
+    pw_entrez <- pw_entrez[!is.na(pw_entrez)]
+    
+    # Subset DE table
+    subset <- de_table[de_table$ENTREZID %in% pw_entrez, ]
+    subset <- subset[!is.na(subset$logFC) & !is.na(subset$FDR), ]
+    
+    if (nrow(subset) < 2)
+      return(c(score = NA, n_genes = nrow(subset), name = pw_name))
+    
+    # Activation Strength
+    score <- mean(subset$logFC * -log10(subset$FDR + 1e-12))
+    
+    return(c(score = score, n_genes = nrow(subset), name = pw_name))
+  }
+  
+  # Build results table
+  mat <- t(sapply(pathways, score_one))
+  df <- as.data.frame(mat, stringsAsFactors = FALSE)
+  
+  df$pathway_id <- pathways
+  df$score <- as.numeric(df$score)
+  df$n_genes <- as.numeric(df$n_genes)
+  
+  # Order by activation
+  df <- df[order(-df$score), ]
+  rownames(df) <- NULL
+  return(df)
+  
+  # Build final table
+  scores <- t(sapply(pathways, score_one))
+  scores <- as.data.frame(scores)
+  scores$pathway_id <- pathways
+  
+  # Add KEGG pathway names
+  scores$pathway_name <- sapply(
+    pathways
+  )
+  # Sort
+  scores <- scores[order(-scores$score), ]
+  rownames(scores) <- NULL
+  return(scores)
+}
+
+activation_results <- calculate_pathway_activation(de_copy, KEGG_immune_paths)
+
+```
+
+## Preparing for STRING
+
+```{r}
+# Bos taurus STRING ID
+string_db <- STRINGdb$new(
+    version = "12",          # STRING v12
+    species = 9913,          # Bos taurus
+    score_threshold = 400,   # medium-high confidence
+    input_directory = ""
+)
+
+# Make sure gene_id is character
+immune_de$gene_id <- as.character(immune_de$gene_id)
+
+mapped <- string_db$map(
+    immune_de,
+    "gene_id",
+    removeUnmappedRows = TRUE
+)
+```
+
+```{r}
+# This section was separated from the above to smoothen the troubleshooting process during
+# the project.
+edges <- string_db$get_interactions(mapped$STRING_id)
+nodes <- mapped[, c(
+    "STRING_id",
+    "gene_id",
+    "gene.ID",
+    "logFC",
+    "FDR",
+    "Region",
+    "gene.description"
+)]
+
+colnames(nodes) <- c(
+    "id",                # STRING_id (Cytoscape key)
+    "ensembl_id",
+    "gene_symbol",
+    "logFC",
+    "FDR",
+    "Region",
+    "description"
+)
+nodes <- nodes[!duplicated(nodes$id), ]
+```
+
+```{r}
+edges_cyto <- data.frame(
+    source = edges$from,
+    target = edges$to,
+    score  = edges$combined_score
+)
+edges_cyto$source <- as.character(edges_cyto$source)
+edges_cyto$target <- as.character(edges_cyto$target)
+
+# The following section is to produce output files for visualisation in Cytoscape.
+# Do ensure file names are changed when producing output files.
+#write.csv(nodes, "JejM_immune_nodes_clean.csv", row.names = FALSE, quote = FALSE)
+#write.csv(edges_cyto, "JejM_immune_edges_clean.csv", row.names = FALSE, quote = FALSE)
+
+#Sanity check
+unique_ids_edges <- unique(c(edges_cyto$source, edges_cyto$target))
+missing_nodes <- setdiff(unique_ids_edges, nodes$id) 
+length(missing_nodes)#length() should be 0
+```
+
+## Gene ranking
+
+```{r}
+rank_candidates <- function(nodes, edges, top_n) {
+  
+  # Ensure character columns
+  nodes$id <- as.character(nodes$id)
+  edges$source <- as.character(edges$source)
+  edges$target <- as.character(edges$target)
+  
+  # Create igraph object
+  g <- graph_from_data_frame(d = edges, vertices = nodes, directed = FALSE)
+  
+  # Compute network centrality metrics
+  centrality <- data.frame(
+    gene_symbol = V(g)$gene_symbol,
+    degree = degree(g, normalized = TRUE),
+    betweenness = betweenness(g, normalized = TRUE),
+    closeness = closeness(g, normalized = TRUE)
+  )
+  
+  # Merge centrality with DESeq data
+  merged <- centrality %>%
+    dplyr::left_join(nodes %>% dplyr::select(gene_symbol, logFC, FDR, Region, description), 
+                     by = "gene_symbol")
+  
+  # Compute a composite score for ranking
+  # Example formula: degree * |logFC| / FDR
+  merged <- merged %>%
+    dplyr::mutate(score = 100 * ((degree * 0.4) + (betweenness * 0.3) + (closeness * 0.3))) %>%
+    dplyr::arrange(desc(score))
+  
+  # Return top N candidates
+  top_candidates <- head(merged, top_n)
+  
+  return(top_candidates)
+}
+
+# Example usage
+top20_genes <- rank_candidates(nodes, edges_cyto, 20)
+
+# View top 20 candidates
+view(top20_genes)
+```
+
+```{r}
+# The following chunk was separated from the above chunk to prevent file overwriting.
+# Change name of file according to gut section.
+write.csv(top20_genes, "JejM_Top20Genes.csv", row.names = FALSE)
+```
